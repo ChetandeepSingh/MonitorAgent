@@ -11,6 +11,7 @@ import os
 import whisper
 import torch
 from groq import Groq
+from supabase import create_client, Client
 from config import settings
 
 # Ensure FFMPEG is in PATH (required by Whisper)
@@ -23,14 +24,23 @@ logger = logging.getLogger(__name__)
 class TranscriptionService:
     """Service to monitor audio files and generate transcriptions using local Whisper"""
     
-    def __init__(self, model_name: str = "base"):
+    def __init__(self, model_name: str = "base", broadcast_callback=None):
         self.audio_dir = Path("output/audio")
         self.processed_files = set()
         self.is_monitoring = False
         self.latest_transcripts = []
+        self.broadcast_callback = broadcast_callback
         
         # Initialize Groq client for AI summaries
         self.groq_client = Groq(api_key=settings.groq_api_key)
+        
+        # Initialize Supabase client
+        if settings.supabase_url and settings.supabase_key:
+            self.supabase: Client = create_client(settings.supabase_url, settings.supabase_key)
+            logger.info("✓ Supabase client initialized")
+        else:
+            self.supabase = None
+            logger.warning("⚠ Supabase credentials not found - using in-memory storage only")
         
         # Load local Whisper model
         # Available models: tiny, base, small, medium, large
@@ -62,6 +72,11 @@ class TranscriptionService:
         
         for audio_file in audio_files:
             if audio_file not in self.processed_files:
+                # Skip files that are still being written (size 0 or too small)
+                file_size = audio_file.stat().st_size
+                if file_size < 10000:  # Skip files smaller than 10KB
+                    continue
+                    
                 logger.info(f"Found new audio file: {audio_file.name}")
                 await self._process_audio_file(audio_file)
                 self.processed_files.add(audio_file)
@@ -97,11 +112,31 @@ class TranscriptionService:
             
             self.latest_transcripts.append(result)
             
+            # Save to Supabase
+            if self.supabase:
+                try:
+                    response = self.supabase.table('transcripts').insert({
+                        'timestamp': timestamp.isoformat(),
+                        'video_start': timestamp.isoformat(),
+                        'video_end': timestamp.isoformat(),
+                        'filename': audio_file.name,
+                        'transcript': transcript,
+                        'summary': summary
+                    }).execute()
+                    logger.info(f"✓ Saved to Supabase (ID: {response.data[0]['id'] if response.data else 'unknown'})")
+                except Exception as e:
+                    logger.error(f"✗ Failed to save to Supabase: {str(e)}")
+            
             logger.info(f"✓ Processed {audio_file.name}")
             logger.info(f"  Transcript: {transcript[:100]}...")
             logger.info(f"  Summary: {summary}")
             
-            # TODO: Save to Supabase
+            # Broadcast to WebSocket clients
+            if self.broadcast_callback:
+                try:
+                    await self.broadcast_callback(result)
+                except Exception as e:
+                    logger.error(f"Failed to broadcast via WebSocket: {str(e)}")
             
         except Exception as e:
             logger.error(f"Error processing {audio_file.name}: {str(e)}", exc_info=True)

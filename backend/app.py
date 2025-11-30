@@ -25,6 +25,7 @@ app.add_middleware(
 # Global service instances
 stream_service = None
 transcription_service = None
+websocket_connections = []
 
 @app.get("/")
 async def root():
@@ -43,7 +44,7 @@ async def start_monitoring():
             )
         
         stream_service = StreamService()
-        transcription_service = TranscriptionService()
+        transcription_service = TranscriptionService(broadcast_callback=broadcast_new_transcript)
         
         # Start the stream and transcription in background
         asyncio.create_task(stream_service.start_stream())
@@ -100,32 +101,51 @@ async def get_status():
     }
 
 @app.get("/api/transcripts")
-async def get_transcripts(limit: int = 10):
+async def get_transcripts(limit: int = 50):
     """Get recent transcripts"""
     if not transcription_service:
-        return {"transcripts": []}
+        return []
     
     transcripts = transcription_service.get_latest_transcripts(limit)
-    return {"transcripts": transcripts, "total": len(transcripts)}
+    return transcripts
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
-    """WebSocket endpoint for real-time updates"""
+    """WebSocket endpoint for real-time transcript updates"""
     await websocket.accept()
-    logger.info("WebSocket connection established")
+    websocket_connections.append(websocket)
+    logger.info(f"WebSocket connection established. Total connections: {len(websocket_connections)}")
     
     try:
         while True:
-            # Keep connection alive and send updates
             await asyncio.sleep(1)
-            
-            if stream_service and hasattr(stream_service, 'latest_data'):
-                await websocket.send_json(stream_service.latest_data)
     
     except WebSocketDisconnect:
-        logger.info("WebSocket connection closed")
+        websocket_connections.remove(websocket)
+        logger.info(f"WebSocket connection closed. Remaining connections: {len(websocket_connections)}")
     except Exception as e:
         logger.error(f"WebSocket error: {str(e)}")
+        if websocket in websocket_connections:
+            websocket_connections.remove(websocket)
+
+async def broadcast_new_transcript(transcript_data: dict):
+    """Broadcast new transcript to all connected WebSocket clients"""
+    if not websocket_connections:
+        return
+    
+    disconnected = []
+    for websocket in websocket_connections:
+        try:
+            await websocket.send_json({
+                "type": "new_transcript",
+                "data": transcript_data
+            })
+        except Exception as e:
+            logger.error(f"Error sending to WebSocket: {str(e)}")
+            disconnected.append(websocket)
+    
+    for ws in disconnected:
+        websocket_connections.remove(ws)
 
 if __name__ == "__main__":
     import uvicorn
